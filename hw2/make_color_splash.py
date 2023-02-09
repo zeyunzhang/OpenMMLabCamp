@@ -1,35 +1,55 @@
-from mmdet.apis import init_detector, inference_detector, show_result_pyplot
-import mmcv
 import cv2
-from pathlib import Path
-from PIL import Image
+import mmcv
+import numpy as np
+import torch
 
-def last_n_parts(filepath: Path, n: int = 2) -> Path:
-    return Path(*filepath.parts[-abs(n):])
+from mmdet.apis import init_detector, inference_detector
+
+score_thr = 0.6
+video_reader = mmcv.VideoReader("test_video.mp4")
+
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+video_writer = cv2.VideoWriter(
+    './test_video_color_splash.mp4', fourcc, video_reader.fps,
+    (video_reader.width, video_reader.height))
+
+device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
 config_file = "configs/mask_rcnn/balloon.py"
 checkpoint_file = "work_dirs/balloon/latest.pth"
-frames_dir = "video/frames"
-segmented_frames_dir = "video/segmented"
 
-model = init_detector(config_file, checkpoint_file)
+model = init_detector(config_file, checkpoint_file, device=device)
 
-video_reader = mmcv.VideoReader("./test_video.mp4")
-video_reader.cvt2frames(frames_dir)
+for frame in video_reader:
+    result = inference_detector(model, frame)
+    mask = None
+    masks = result[1][0]
+    for i in range(len(masks)):
+        if result[0][0][i][-1] >= score_thr:
+            if not mask is None:
+                mask = mask | masks[i]
+            else:
+                mask = masks[i]
 
-for img in Path(frames_dir).iterdir():
-    print(img)
-    print(last_n_parts(Path(img), 1))
-    result = inference_detector(model, img)
+    # 获取各通道mask像素
+    masked_b = frame[:, :, 0] * mask
+    masked_g = frame[:, :, 1] * mask
+    masked_r = frame[:, :, 2] * mask
+    masked = np.concatenate([masked_b[:,:,None],masked_g[:,:,None],masked_r[:,:,None]],axis=2)
 
-    frame = model.show_result(img, result, 0.5)
-    image_pil = Image.fromarray(frame)
-    image_pil.save(Path(segmented_frames_dir) / last_n_parts(img, 1))
+    # frame转灰度图
+    un_mask = 1 - mask
+    frame_b = frame[:, :, 0] * un_mask
+    frame_g = frame[:, :, 1] * un_mask
+    frame_r = frame[:, :, 2] * un_mask
+    frame = np.concatenate([frame_b[:, :, None], frame_g[:, :, None], frame_r[:, :, None]], axis=2).astype(np.uint8)
+    frame = mmcv.bgr2gray(frame, keepdim=True)
+    frame = np.concatenate([frame, frame, frame], axis=2)
 
-mmcv.video.frames2video(segmented_frames_dir, "./test_video_color_splash.mp4")
+    # mask加到灰度图中
+    frame += masked
 
-"""
-img_org = Image.open(img_url)
-img_gray= img_org.convert('L')
-img_gray.save(img_out)
-"""
+    video_writer.write(frame)
+
+video_writer.release()
+cv2.destroyAllWindows()
